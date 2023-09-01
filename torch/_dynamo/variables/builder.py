@@ -686,6 +686,41 @@ class VariableBuilder:
                 source=self.source,
                 guards=make_guards(GuardBuilder.FUNCTION_MATCH),
             )
+        elif isinstance(value, torch.SymInt):
+            val = value.node.require_hint()
+            assert isinstance(val, int) and val in (
+                0,
+                1,
+            ), "Currently only 0 or 1 SymInts are supported."
+
+            new_symint = self.tx.output.shape_env.create_unspecified_symint_and_symbol(
+                val,
+                self.source,
+                dynamic_dim=DimDynamic.DYNAMIC,
+            )
+
+            new_symbool = new_symint == 1
+            sym_node_proxy = self.tx.output.root_tracer.create_graph_input(
+                re.sub(r"[^a-zA-Z0-9]+", "_", self.name),
+                type(new_symbool),
+                source=self.source,
+            )
+            sym_node_proxy.node.meta["grapharg"] = GraphArg(
+                self.source,
+                new_symbool,
+                False,
+                None,
+                is_tensor=False,
+                example_strong_ref=new_symbool,
+            )
+            self.tx.output.tracked_fakes.append(
+                TrackedFake(new_symbool, self.source, None)
+            )
+            return SymNodeVariable(
+                sym_node_proxy,
+                new_symbool,
+                source=self.source,
+            )
         else:
             result = UserDefinedObjectVariable(
                 value,

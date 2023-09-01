@@ -19,11 +19,18 @@ import torch._dynamo.testing
 from functorch.experimental.control_flow import cond
 from torch._dynamo import config
 from torch._dynamo.exc import UserError
+from torch._dynamo.testing import normalize_gm
 from torch._export import dynamic_dim
 from torch._export.constraints import constrain_as_size, constrain_as_value
 from torch._higher_order_ops.out_dtype import out_dtype
+from torch._subclasses import fake_tensor
 from torch.fx.experimental.proxy_tensor import make_fx
-from torch.fx.experimental.symbolic_shapes import ConstraintViolationError
+from torch.fx.experimental.symbolic_shapes import (
+    ConstraintViolationError,
+    create_symint_from_symbool,
+    DimDynamic,
+    ShapeEnv,
+)
 from torch.testing._internal import common_utils
 
 
@@ -3102,8 +3109,6 @@ def forward(self, x):
 
     def test_capture_symbolic_tracing_simple_within_fake_mode(self):
         from torch._dynamo.output_graph import config
-        from torch._subclasses import fake_tensor
-        from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
         def f(x):
             y = torch.randn(3)
@@ -3124,6 +3129,71 @@ def forward(self, x):
                     msg="test_capture_symbolic_tracing_simple_within_fake_mode_aten_graph_"
                     + str(aten_graph),
                 )
+
+    def test_export_with_symbool_inputs(self):
+        def f(pred: bool, x: torch.Tensor):
+            if pred:
+                return x.sin()
+            else:
+                return x.cos()
+
+        x = torch.randn([3, 4])
+
+        def test_symbool_guards(f, shape_env, size_tests, exp_graph, exp_guard_code):
+            dim_dynamic = DimDynamic.DYNAMIC
+            with fake_tensor.FakeTensorMode(
+                shape_env=shape_env,
+            ) as fake_mode:
+                fake_x = fake_mode.from_tensor(
+                    x, dynamic_dims=[dim_dynamic for _ in range(x.dim())]
+                )
+                for i, size in enumerate(size_tests):
+                    pred = fake_x.size(0) == size
+                    int_pred = create_symint_from_symbool(pred)
+                    gm, guards = torch._dynamo.export(f)(int_pred, x)
+                    actual = normalize_gm(gm.print_readable(print_output=False))
+                    self.assertExpectedInline(actual, exp_graph[i])
+                    shape_env_guards = [
+                        guard for guard in guards if "SHAPE_ENV" in guard.guard_types
+                    ]
+                    self.assertEqual(len(shape_env_guards), 1)
+                    guard_code_on_predicate = [
+                        code
+                        for code in shape_env_guards[0].code_list
+                        if "L['pred']" in code
+                    ]
+                    self.assertEqual(guard_code_on_predicate, exp_guard_code[i])
+
+        true_graph = """\
+class GraphModule(torch.nn.Module):
+    def forward(self, pred, x):
+        arg0, arg1: f32[s0, s1], = fx_pytree.tree_flatten_spec(([pred, x], {}), self._in_spec)
+        sin = arg1.sin();  arg1 = None
+        return pytree.tree_unflatten([sin], self._out_spec)
+"""
+        false_graph = """\
+class GraphModule(torch.nn.Module):
+    def forward(self, pred, x):
+        arg0, arg1: f32[s0, s1], = fx_pytree.tree_flatten_spec(([pred, x], {}), self._in_spec)
+        cos = arg1.cos();  arg1 = None
+        return pytree.tree_unflatten([cos], self._out_spec)
+"""
+        true_guard_code = ["L['pred'] == 1"]
+        false_guard_code = ["L['pred'] == 0"]
+        test_symbool_guards(
+            f,
+            ShapeEnv(),
+            [3, 3],
+            [true_graph, true_graph],
+            [true_guard_code, true_guard_code],
+        )
+        test_symbool_guards(
+            f,
+            ShapeEnv(),
+            [4, 5],
+            [false_graph, false_graph],
+            [false_guard_code, false_guard_code],
+        )
 
     def test_invalid_input_global(self) -> None:
         global bulbous_bouffant
