@@ -2196,6 +2196,14 @@ class ShapeEnvEvent:
     def is_defer_runtime_assert(self) -> bool:
         return self.name == "defer_runtime_assert"
 
+    def getarg(self, *, index: int, key: str) -> Any:
+        if self.args is not None and index < len(self.args):
+            return self.args[index]
+        elif self.kwargs is not None and key in self.kwargs:
+            return self.kwargs[key]
+        return None
+
+
 class ShapeEnv:
     # This is a wrapper over the actual __init__ function.
     #
@@ -2664,6 +2672,11 @@ class ShapeEnv:
         if _translation_validation_enabled() and node is not None:
             self.name_to_node.pop(node.name)
             self.graph.erase_node(node)
+
+    def add_fx_node_metadata(self, node: torch.fx.Node) -> None:
+        from torch._dynamo.utils import get_current_node
+        node.meta["event"] = self.last_event_index()
+        node.meta["node"] = get_current_node()
 
     def _suppress_guards_tls(self):
         return getattr(TLS, "suppress_guards", False)
@@ -3425,7 +3438,9 @@ class ShapeEnv:
 
         # First, issue all the non-trivial guards.
         for guard in self.guards:
-            if self._maybe_evaluate_static(guard.expr) is not None:
+            static_expr = self._maybe_evaluate_static(guard.expr)
+            if static_expr is not None:
+                self.log.debug("eval %s == %s [statically known]", guard.expr, static_expr)
                 continue
             issue_guard(guard)
 
@@ -3986,6 +4001,14 @@ class ShapeEnv:
                 eql, _ = self.create_fx_call_function(operator.eq, (fx_node, concrete_val))
                 node, fresh = self.create_fx_call_function(torch._assert, (eql,))
 
+            assert node is not None
+            # If this is a fresh node, we have to remember the event index that
+            # corresponds to this assertion node.
+            # Reason: so that, given an assertion node, we can replay the ShapeEnv
+            # events until the point where this assertion node was freshly created.
+            if fresh:
+                self.add_fx_node_metadata(node)
+
         # After creating the FX node corresponding to orig_expr, we must make sure that
         # no error will be raised until the end of this function.
         #
@@ -4024,9 +4047,12 @@ class ShapeEnv:
 
             self._check_frozen(expr, concrete_val)
 
-            if torch._dynamo.config.inject_EVALUATE_EXPR_flip_equality_TESTING_ONLY and isinstance(hint, bool):
-                if isinstance(expr, (sympy.Eq, sympy.Ne)):
-                    expr = sympy.Not(expr)
+            if (
+                    torch._dynamo.config.inject_EVALUATE_EXPR_flip_equality_TESTING_ONLY
+                    and isinstance(hint, bool)
+                    and isinstance(expr, (sympy.Eq, sympy.Ne))
+            ):
+                expr = sympy.Not(expr)
 
             if isinstance(expr, (sympy.Eq, sympy.Ne)):
                 self._maybe_guard_eq(expr, bool(concrete_val))
@@ -4106,7 +4132,10 @@ class ShapeEnv:
             and fx_node is not None
             and not self._suppress_guards_tls()
         ):
-            self.create_fx_call_function(torch._assert, (fx_node,))
+            node, fresh = self.create_fx_call_function(torch._assert, (fx_node,))
+            assert node is not None
+            if fresh:
+                self.add_fx_node_metadata(node)
 
         self._check_frozen(expr, sympy.true)
 
@@ -4250,3 +4279,116 @@ class FakeTensorMeta:
     @staticmethod
     def from_fake(fake) -> "FakeTensorMeta":
         return FakeTensorMeta(fake.size(), fake.stride(), fake.storage_offset())
+
+# Translation validation bisection.
+#
+# Bisect into the torch._assert nodes recorded in the shape_env FX graph, and raise
+# the earliest ValidationException.
+#
+# As guards are added by ShapeEnv.evaluate_expr calls, some simplification errors
+# might be silently happening. This function tries to nail down exactly at which
+# point things went wrong from a validation perspective.
+def bisect(shape_env: ShapeEnv):
+    from torch.fx.experimental.validator import ValidationException, BisectValidationException
+
+    events = shape_env.events
+
+    # Retrieves the ShapeEnvEvent associated with node.
+    def get_node_event(node: torch.fx.Node) -> ShapeEnvEvent:
+        assert "event" in node.meta
+        return events[node.meta["event"]]
+
+    # Creates a new instance of fake, but updating every symbolic value's ShapeEnv
+    # reference to the one given as argument.
+    #
+    # This is needed so as not to simplify a symbolic expression using a ShapeEnv
+    # "from the future", where it may have a different set of replacements.
+    def new_with_shape_env(shape_env: ShapeEnv, fake) -> Any:
+        if isinstance(fake, int):
+            return fake
+        if isinstance(fake, SymInt):
+            return SymInt(fake.node.with_shape_env(shape_env))
+        assert isinstance(fake, FakeTensorMeta)
+        return FakeTensorMeta(
+            tuple(new_with_shape_env(shape_env, s) for s in fake.size()),
+            tuple(new_with_shape_env(shape_env, s) for s in fake.stride()),
+            new_with_shape_env(shape_env, fake.storage_offset()),
+        )
+
+    # Checks whether the given shape_env fails when produce_guards is called.
+    def check_shapeenv_fails(shape_env: ShapeEnv, tracked_fakes: Optional[List[Any]]) -> Optional[ValidationException]:
+        assert tracked_fakes is not None
+        try:
+            # This produce_guards call is a best-effort replication, since we
+            # don't populate EqualityConstraint list. Reason: we would also have
+            # to save OutputGraph.tracked_fakes_id_to_source.
+            shape_env.produce_guards(
+                [new_with_shape_env(shape_env, a.fake) for a in tracked_fakes],
+                [a.source for a in tracked_fakes],
+                constraint_inputs=[a.constraint_dims for a in tracked_fakes],
+            )
+        except ValidationException as e:
+            return e
+
+    # Checks whether the ShapeEnv reconstructed by replaying the events until
+    # node is created fails when produce_guards is called.
+    def check_node_fails(node: torch.fx.Node) -> Optional[ValidationException]:
+        number = node.meta["event"]
+        # Reconstruct shape_env until the event at event_number.
+        shape_env = replay_shape_env_events(events[:number + 1])
+        shape_env.graph.lint()
+        return check_shapeenv_fails(shape_env, events[number].tracked_fakes)
+
+    last_exception = check_shapeenv_fails(shape_env, shape_env.snapshot_tracked_fakes())
+
+    if not last_exception:
+        # We don't actually fail due to a produce_guards call.
+        # Stop and don't bisect.
+        return
+
+    if torch._dynamo.config.translation_validation_no_bisect:
+        # Bisection is off.
+        # Return the last ValidationException we got.
+        raise last_exception
+
+    # Cache the raised exception (if any) at each bisection point.
+    exception = {}
+
+    # Bisection happens on the assertion nodes of the recorded FX graph for
+    # dynamic shapes.
+    assert_nodes = [node for node in shape_env.graph.nodes if node.target == torch._assert]
+
+    # Preparing the indices for binary search.
+    left, mid, right = 0, 0, len(assert_nodes) - 1
+
+    while left < right:
+        mid = (left + right) // 2
+
+        node = assert_nodes[mid]
+        log.debug("bisecting at %s: %s", mid, get_node_event(node))
+
+        # Check whether the new shape_env raises a ValidationException or not.
+        exception[mid] = check_node_fails(node)
+
+        if exception[mid]:
+            right = mid
+        else:
+            left = mid + 1
+
+    assert left in exception and isinstance(exception[left], ValidationException)
+
+    node = assert_nodes[left]
+    event = get_node_event(node)
+
+    if event.is_evaluate_expr():
+        failed_action = "evaluating"
+    else:
+        assert event.is_defer_runtime_assert(), f"unexpected event type: {event}"
+        failed_action = "adding runtime assert"
+
+    raise BisectValidationException(
+        exception[left],
+        expr=event.getarg(index=1, key="orig_expr"),
+        failed_action=failed_action,
+        traced_node=node.meta["node"],
+    )
