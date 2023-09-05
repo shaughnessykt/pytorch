@@ -726,17 +726,8 @@ def _listvariable_unflatten(values: List[Any], context: pytree.Context) -> ListV
     return ListVariable(values, mutable_local=MutableLocal())
 
 
-def _register_dynamo_list_to_tree_spec():
-    pytree._register_pytree_node(
-        ListVariable,
-        _listvariable_flatten,
-        _listvariable_unflatten,
-    )
-
-    fx_pytree.register_pytree_flatten_spec(
-        ListVariable,
-        _listvariable_flatten,
-    )
+pytree._register_pytree_node(ListVariable, _listvariable_flatten, _listvariable_unflatten)
+fx_pytree.register_pytree_flatten_spec(ListVariable, _listvariable_flatten)
 
 
 def _tuplevariable_flatten(d: TupleVariable) -> Tuple[List[Any], pytree.Context]:
@@ -752,17 +743,8 @@ def _tuplevariable_unflatten(
     return TupleVariable(values)
 
 
-def _register_dynamo_tuple_to_tree_spec():
-    pytree._register_pytree_node(
-        TupleVariable,
-        _tuplevariable_flatten,
-        _tuplevariable_unflatten,
-    )
-
-    fx_pytree.register_pytree_flatten_spec(
-        TupleVariable,
-        _tuplevariable_flatten,
-    )
+pytree._register_pytree_node(TupleVariable, _tuplevariable_flatten, _tuplevariable_unflatten)
+fx_pytree.register_pytree_flatten_spec(TupleVariable, _tuplevariable_flatten)
 
 
 class SetVariable(VariableTracker):

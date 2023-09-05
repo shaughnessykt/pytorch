@@ -21,7 +21,13 @@ from ..exc import (
 )
 from ..guards import GuardBuilder
 from ..replay_record import DummyModule
-from ..source import AttrSource, is_constant_source, SuperSource, TypeSource
+from ..source import (
+    AttrSource,
+    GetItemSource,
+    is_constant_source,
+    SuperSource,
+    TypeSource,
+)
 from ..utils import (
     build_checkpoint_variable,
     check_constant_args,
@@ -29,6 +35,7 @@ from ..utils import (
     check_unspec_python_args,
     get_fake_value,
     guard_if_dyn,
+    is_treespec_cls,
     is_utils_checkpoint,
     istype,
     numpy_operator_wrapper,
@@ -1084,6 +1091,20 @@ class BuiltinVariable(VariableTracker):
         else:
             source = None
 
+        if isinstance(obj, variables.ConstantVariable) and is_treespec_cls(
+            obj.python_type()
+        ):
+            value = obj.as_python_constant()
+            if name == "type":
+                return variables.UserDefinedClassVariable(value=value.type)
+            if name == "children_specs":
+                return variables.ListVariable(
+                    [
+                        variables.ConstantVariable(value=spec)
+                        for spec in value.children_specs
+                    ]
+                )
+
         if isinstance(obj, variables.NNModuleVariable):
             return obj.var_getattr(tx, name).add_options(options)
         elif isinstance(obj, variables.TensorVariable) and name == "grad":
@@ -1101,6 +1122,21 @@ class BuiltinVariable(VariableTracker):
                 unimplemented("tensor grad")
             else:
                 unimplemented("tensor grad")
+        elif name == "__bases__":
+            value = obj.as_python_constant()
+            if isinstance(value, type):
+                bases = value.__bases__
+                if source is None:
+                    assert len(bases) == 1 and (
+                        bases[0] is object or bases[0] is torch._C._TensorBase
+                    ), f"{value.__name__}.bases: {bases}"
+                    tuple_args = [BuiltinVariable(bases[0])]
+                else:
+                    tuple_args = [
+                        VariableBuilder(tx, GetItemSource(source, i))(b)
+                        for i, b in enumerate(bases)
+                    ]
+                return variables.TupleVariable(tuple_args, **options)
         elif isinstance(
             obj,
             (
@@ -1217,11 +1253,7 @@ class BuiltinVariable(VariableTracker):
                 self, obj
             )
 
-        raise UserError(
-            UserErrorType.ANTI_PATTERN,
-            "Can't call type() on generated custom object. "
-            "Please use __class__ instead",
-        )
+        return ConstantVariable(py_type)
 
     def call_reversed(self, tx, obj: VariableTracker):
         if obj.has_unpack_var_sequence(tx):
@@ -1294,7 +1326,11 @@ class BuiltinVariable(VariableTracker):
             mod = tx.output.get_submodule(nn_mod_variable.module_key)
             return variables.ConstantVariable(id(mod))
         else:
-            unimplemented(f"call_id with args {args}")
+            try:
+                value = args[0].as_python_constant()
+                return variables.ConstantVariable(id(value))
+            except Exception:
+                unimplemented(f"call_id with args {args}")
 
     def _comparison(self, tx, left, right):
         """

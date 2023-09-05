@@ -4,7 +4,7 @@ from typing import Dict, List
 import torch
 
 from .. import variables
-from ..exc import unimplemented
+from ..exc import unimplemented, UserError, UserErrorType
 from ..utils import istype, np
 from .base import typestr, VariableTracker
 
@@ -81,6 +81,12 @@ class ConstantVariable(VariableTracker):
             raise NotImplementedError from e
 
     def const_getattr(self, tx, name):
+        if isinstance(self.value, type):
+            raise UserError(
+                UserErrorType.ANTI_PATTERN,
+                "Can't access members of type(obj) for a generated custom object. "
+                "Please use __class__ instead",
+            )
         member = getattr(self.value, name)
         if callable(member):
             raise NotImplementedError()
@@ -93,6 +99,7 @@ class ConstantVariable(VariableTracker):
         args: "List[VariableTracker]",
         kwargs: "Dict[str, VariableTracker]",
     ) -> "VariableTracker":
+        from torch.utils._pytree import NodeDef
         from .tensor import SymNodeVariable
 
         options = VariableTracker.propagate(self, args, kwargs.values())
@@ -112,6 +119,13 @@ class ConstantVariable(VariableTracker):
             # Promote to SymNodeVariable for operations involving dynamic shapes.
             return variables.SymNodeVariable(self.as_proxy(), self.value).call_method(
                 tx, name, args, kwargs
+            )
+
+        if isinstance(self.value, NodeDef) and name in ("flatten_fn", "unflatten_fn"):
+            return tx.inline_user_function_return(
+                variables.UserFunctionVariable(getattr(self.value, name), **options),
+                args,
+                kwargs,
             )
 
         try:
