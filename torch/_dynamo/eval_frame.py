@@ -12,7 +12,6 @@ import threading
 import traceback
 import types
 import warnings
-from collections import namedtuple
 from enum import Enum
 from os.path import dirname, join
 from typing import (
@@ -95,15 +94,26 @@ DONT_WRAP_FILES = {
 }
 
 
-CacheEntry = namedtuple("CacheEntry", "check_fn, code")
+# This class has a `check_fn` field for the guard,
+#  and a `code` field for the code object.
+CacheEntry = torch._C._dynamo.eval_frame._CacheEntry
 
 
-def _debug_get_cache_entry_list(code: types.CodeType) -> List[CacheEntry]:
+def _debug_get_cache_entry_list(
+    code: Union[types.CodeType, Callable[..., Any]]
+) -> List[CacheEntry]:  # type: ignore[valid-type]
     """
-    Given a code object, retrieve the cache entries stored in this code.
+    Given a code object or a callable object, retrieve the cache entries
+     stored in this code.
     """
-    cache_list = torch._C._dynamo.eval_frame._debug_get_cache_entry_list(code)
-    return list(map(CacheEntry._make, cache_list))
+    if callable(code):
+        code = code.__code__
+    cache_head = torch._C._dynamo.eval_frame._debug_get_cache_entry_list(code)
+    cache_list = []
+    while cache_head is not None:
+        cache_list.append(cache_head)
+        cache_head = cache_head.next
+    return cache_list
 
 
 class OptimizedModule(torch.nn.Module):
@@ -478,9 +488,11 @@ def catch_errors_wrapper(callback, hooks: Hooks):
                         bucket_bytes_cap=ddp_module.bucket_bytes_cap,
                         backend_compile_fn=callback._torchdynamo_orig_callable,
                     )
-                    hijacked_callback = convert_frame.convert_frame(
+                    assert hasattr(
+                        callback, "_clone_with_backend"
+                    ), "DDPOptimizer only supports callback fns that know how to clone themselves."
+                    hijacked_callback = callback._clone_with_backend(
                         ddp_optimizer.compile_fn,
-                        hooks=hooks,
                     )
                     return hijacked_callback(frame, cache_entry, hooks, frame_state)
 
@@ -1364,11 +1376,6 @@ class TorchPatcher:
             torch.optim.LBFGS,
         }
         for opt in optimizer_classes:
-            # We disable `register_load_state_dict_pre_hook` to allow torch.compile to trace
-            # through the optimizer init without failing. See #107789
-            opt.register_load_state_dict_pre_hook = disable(
-                opt.register_load_state_dict_pre_hook
-            )
             if opt in excluded_optimizer_classes:
                 opt.step = disable(opt.step)
 
