@@ -347,14 +347,12 @@ def promote_constants(inputs, override_return_dtype=None):
     ex = next(x for x in inputs if isinstance(x, (TensorBox, ExpandView)))
     out = []
     for x in inputs:
-        if isinstance(x, (int, float)):
+        if isinstance(x, (int, float, sympy.Expr)):
             out.append(
                 ExpandView.create(
                     ir.Constant(x, ex.get_dtype(), ex.get_device()), list(ex.get_size())
                 )
             )
-        elif isinstance(x, sympy.Expr):
-            out.append(IndexingConstant(x, ex.get_dtype(), ex.get_device()))
         else:
             out.append(x)
 
